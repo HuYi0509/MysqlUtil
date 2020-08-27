@@ -15,7 +15,8 @@
 
 寒轩也该结束了,现在开始介绍如何使用MysqlUtil
 -----------------------------------------------------------------------------------------------------
-创造mysql联接:
+
+#### 创造mysql联接:
   MysqlUtil mysqlUtil = new MysqlUtil("com.mysql.cj.jdbc.Driver", "jdbc:mysql://localhost:3306/test?        characterEncoding=UTF8&serverTimezone=Asia/Shanghai&useLocalSessionState=true","root", "root");
 
 sql四件套，各位不陌生的吧，创造对象创造联接，多个对象联接多个数据库
@@ -23,14 +24,14 @@ sql四件套，各位不陌生的吧，创造对象创造联接，多个对象�
   List<Map<String, Object>> data = mysqlUtil.select("select * from entity_friend");
   System.out.println(data);
   
-查询并打印对象
+#### 查询并打印对象
 
   MysqlUtil mysqlUtil = new MysqlUtil("com.mysql.cj.jdbc.Driver", "jdbc:mysql://localhost:3306/test?characterEncoding=UTF8&serverTimezone=Asia/Shanghai&useLocalSessionState=true","root", "root");
   List<Map<String, Object>> data = mysqlUtil.select("select * from entity_friend");
   List<Friend> list = MysqlUtil.getObject(data, Friend.class);
   System.out.println(list);
   
-从data取出对象并打印
+#### 从data取出对象并打印
 
   MysqlUtil mysqlUtil = new MysqlUtil("com.mysql.cj.jdbc.Driver", "jdbc:mysql://localhost:3306/test?characterEncoding=UTF8&serverTimezone=Asia/Shanghai&useLocalSessionState=true","root", "root");
   Friend friend = new Friend();
@@ -38,6 +39,6 @@ sql四件套，各位不陌生的吧，创造对象创造联接，多个对象�
   data=MysqlUtil.autoConvertData1(data);
   System.out.println(mysqlUtil.insert(data, "entity_friend", true, false));
   
-把两个Friend对象放入data，把key的命名从object换成column之后，对entity_friend进行插入
+#### 把两个Friend对象放入data，把key的命名从object换成column之后，对entity_friend进行插入
 
-更多的自行翻翻，相信能给各位不少惊喜~
+#### 更多的自行翻翻，相信能给各位不少惊喜~
