@@ -1,5 +1,3 @@
-import org.springframework.lang.NonNull;
-
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
 import java.sql.*;
@@ -42,7 +40,7 @@ public class MysqlUtil {
     private String password;
     private Connection conn;
 
-    public MysqlUtil(@NonNull Connection conn) {
+    public MysqlUtil(Connection conn) {
         this.conn = conn;
     }
 
@@ -69,12 +67,12 @@ public class MysqlUtil {
         }
     }
 
+    //--------------------------------------------------------------------------------------------------------------------------------------
+
     /**
-     * 查詢
-     *
+     * 普通查詢
      * @param sql     sql語句
      * @param objects 與?對應的物件
-     * @return data
      * @throws SQLException 查詢異常
      */
     synchronized public List<Map<String, Object>> select(String sql, Object... objects) throws SQLException {
@@ -84,8 +82,54 @@ public class MysqlUtil {
     }
 
     /**
-     * 查詢
-     *
+     * 用map+convertString查詢
+     * @param map   資料源
+     * @param sql   sql
+     * @param convertString "columnName=mapField"
+     */
+    synchronized public List<Map<String, Object>> select(Map<String, Object> map,String sql,String convertString) throws SQLException {
+        Map<String, String> convertMap = convertStringToMap2(convertString);
+        ArrayList<Object> paras = new ArrayList<>();
+        convertMap.keySet().forEach(key->{paras.add(map.get(convertMap.get(key)));});
+        return select(sql,paras.toArray());
+    }
+
+    /**
+     * 自動生成sql語句
+     * @param map   要比對的資料
+     * @param table 要查詢的表
+     * @return  查詢結果
+     */
+    synchronized public List<Map<String, Object>> select(Map<String, Object> map,String table) throws SQLException {
+        List<String> columns = getTableColumns(table).stream().map(m ->(String) m.get("COLUMN_NAME")).collect(Collectors.toList());
+        List<Map<String, Object>> list = new ArrayList<>();
+        list.add(map);
+        String[] s = createWhereAndConvertString(list, table, true);
+        StringBuilder sql = new StringBuilder("select ");
+        sql.append(columns.toString().replaceAll("[\\[\\]]","`").replaceAll(", ","`,`"));
+        sql.append(" from `").append(table).append("`");
+        if(!s[0].equals("")){
+            sql.append(" where ");
+            //這邊要拼湊where
+            ArrayList<Object> paras = new ArrayList<>();
+            boolean isFirst = true;
+            for (String s1 : s[0].split(",")) {
+                if(isFirst){
+                    isFirst=false;
+                }else{
+                    sql.append(" and ");
+                }
+                //大概都是單詞
+                sql.append(s1).append("=?");
+                paras.add(map.get(s1));
+            }
+            return select(sql.toString(),paras.toArray());
+        }
+        return select(sql.toString());
+    }
+
+    /**
+     * 查詢並將結果放至data
      * @param data    資料要存放的地方
      * @param sql     sql語句
      * @param objects 與?對應的物件
@@ -121,6 +165,35 @@ public class MysqlUtil {
     }
 
     /**
+     * 查詢，根據data的某些字段進行查詢，並把結果合併至data
+     * @param data  資料
+     * @param sql   sql
+     * @param convertString 要查詢/整合的字段
+     * @throws SQLException Exception
+     */
+    synchronized public void selectAndCombine(List<Map<String, Object>> data, String sql, String convertString) throws SQLException{
+        Map<String, String> map = convertStringToMap2(convertString);
+        //使用union嗎?那就使用union吧
+        StringBuilder sqls = new StringBuilder();
+        for (int i = 0; i < data.size(); i++) {
+            sqls.append(" UNION ").append(sql);
+        }
+
+        sql = sqls.toString().replaceFirst(" UNION","");
+        List<Object> paras = new ArrayList<>();
+        data.forEach(i->{
+            map.values().forEach(v->{
+                paras.add(i.get(v));
+            });
+        });
+
+        List<Map<String, Object>> data1 = select(sql, paras.toArray());
+        data1=combineData(data,data1,convertString);
+        data.clear();
+        data.addAll(data1);
+    }
+
+    /**
      * insert自動處理，須要讀取information_schema.COLUMNS的權限
      * 只更新表所含有的欄位
      *
@@ -145,27 +218,12 @@ public class MysqlUtil {
      * @return 更新成功數量
      */
     synchronized public int insert(List<Map<String, Object>> data, String table, String convertString, boolean onDuplicateKeyUpdate) {
-        checkConn();
-        Map<String, String> convertMap = MysqlUtil.convertStringToMap(convertString);
-        StringBuilder sql = new StringBuilder("insert ignore into `").append(table).append("`(");
-        ArrayList<Object> paras = new ArrayList<>();
-        sql.append(MysqlUtil.customToString(convertMap, "`@key`", ",")).append(") values ");
-        for (int i = 0; i < data.size(); i++) {
-            if (i != 0)
-                sql.append(",");
-            StringBuilder sb2 = new StringBuilder("(");
-            for (String key : convertMap.keySet()) {
-                sb2.append(",?");
-                paras.add(data.get(i).get(convertMap.get(key)));
-            }
-            sb2.append(")");
-            sql.append(sb2.toString().replaceFirst(",", ""));
-        }
-        if (onDuplicateKeyUpdate) {
-            sql.append(" ON DUPLICATE KEY UPDATE ").append(MysqlUtil.customToString(convertMap, "@key=IF(ISNULL(VALUES(@key)),@key,VALUES(@key))", ","));
-        }
+        Object[] o = makeInsertSql(data, table, convertString, onDuplicateKeyUpdate);
+        String sql = (String) o[0];
+        //noinspection unchecked
+        ArrayList<Object> paras = (ArrayList<Object>) o[1];
         try {
-            PreparedStatement psql = conn.prepareStatement(sql.toString(), PreparedStatement.RETURN_GENERATED_KEYS);
+            PreparedStatement psql = conn.prepareStatement(sql, PreparedStatement.RETURN_GENERATED_KEYS);
             for (int i = 0; i < paras.size(); i++) {
                 psql.setObject(i + 1, paras.get(i));
             }
@@ -174,6 +232,51 @@ public class MysqlUtil {
             e.printStackTrace();
         }
         return 0;
+    }
+
+    /**
+     * 執行insert，並且返回GeneratedKeys
+     * @param data  要插入的資料
+     * @param table 要插入的表
+     * @param convertFirst 需要更新的columns是否以第一個資料為準(如果存放類型一樣，就用true)
+     * @param onDuplicateKeyUpdate  是否在無法插入(重複主鍵、唯一鍵)時進行更新，如果資料含有多行唯一、主鍵，則容易造成死鎖
+     * @return  GeneratedKeys
+     */
+    synchronized public Object[] insertAndReturnKey(List<Map<String, Object>> data, String table, boolean convertFirst, boolean onDuplicateKeyUpdate){
+        return insertAndReturnKey(data, table, createConvertString(data, table, convertFirst), onDuplicateKeyUpdate);
+    }
+
+    /**
+     * 執行insert，並且返回GeneratedKeys
+     * @param data  要插入的資料
+     * @param table 要插入的表
+     * @param convertString 要插入的字段、轉換字段,"要插入的欄位名=資料的欄位名"，同名可省略微"要插入的欄位名"
+     *                      若是null，空字段，自動把所有的資料欄位拿去更新(注意，很可能會報錯)
+     * @param onDuplicateKeyUpdate  是否在無法插入(重複主鍵、唯一鍵)時進行更新，如果資料含有多行唯一、主鍵，則容易造成死鎖
+     * @return  GeneratedKeys
+     */
+    synchronized public Object[] insertAndReturnKey(List<Map<String, Object>> data, String table, String convertString, boolean onDuplicateKeyUpdate){
+        Object[] o = makeInsertSql(data, table, convertString, onDuplicateKeyUpdate);
+        String sql = (String) o[0];
+        //noinspection unchecked
+        ArrayList<Object> paras = (ArrayList<Object>) o[1];
+        try {
+            PreparedStatement psql = conn.prepareStatement(sql.toString(), PreparedStatement.RETURN_GENERATED_KEYS);
+            for (int i = 0; i < paras.size(); i++) {
+                psql.setObject(i + 1, paras.get(i));
+            }
+            psql.executeUpdate();
+            ArrayList<Object> objects = new ArrayList<>();
+            ResultSet rs = psql.getGeneratedKeys();
+            if(rs!=null)
+                while (rs.next()){
+                    objects.add(rs.getObject(1));
+                }
+            return objects.toArray();
+        } catch (SQLException e) {
+            e.printStackTrace();
+        }
+        return new Object[0];
     }
 
     /**
@@ -229,13 +332,13 @@ public class MysqlUtil {
         checkConn();
         Map<String, String> whereMap = convertStringToMap(whereString);
         Map<String, String> convertMap = convertStringToMap(convertString);
-        StringBuilder sql = new StringBuilder("updata `").append(table).append("` a join (");
+        StringBuilder sql = new StringBuilder("update `").append(table).append("` a join (");
         StringBuilder sb = new StringBuilder();
         List<Object> paras = new ArrayList<>();
         for (int i = 0; i < data.size(); i++) {
             sb.append(" union select ");
             if (i == 0) {
-                sb.append(customToString(whereMap, "? as `@key`", ",")).append(",").append(customToString(convertMap, "? as `@key`", ","));
+                sb.append(customToString(whereMap, "? as '@key'", ",")).append(",").append(customToString(convertMap, "? as '@key'", ","));
             } else {
                 sb.append(customToString(whereMap, "?", ",")).append(",").append(customToString(convertMap, "?", ","));
             }
@@ -243,7 +346,7 @@ public class MysqlUtil {
             whereMap.keySet().forEach(key -> paras.add(data.get(finalI).get(whereMap.get(key))));
             convertMap.keySet().forEach(key -> paras.add(data.get(finalI).get(convertMap.get(key))));
         }
-        sql.append(sb.toString().replaceFirst(" union ", "")).append(") using(").append(customToString(whereMap, "@key", ","));
+        sql.append(sb.toString().replaceFirst(" union ", "")).append(") b using(").append(customToString(whereMap, "@key", ","));
         sql.append(") set ").append(customToString(convertMap, "a.@key = if(isnull(b.@key),a.@key,b.@key)", ","));
         try {
             PreparedStatement psql = conn.prepareStatement(sql.toString());
@@ -300,6 +403,8 @@ public class MysqlUtil {
         return new int[]{};
     }
 
+    //--------------------------------------------------------------------------------------------------------------------------------------
+
     /**
      * 把對象轉為data
      *
@@ -351,7 +456,13 @@ public class MysqlUtil {
                 fields.forEach(field -> {
                     field.setAccessible(true);
                     try {
-                        field.set(c,map.get(field.getName()));
+                        if(field.getType().equals(map.get(field.getName()).getClass())){
+                            field.set(c,map.get(field.getName()));
+                        }else {
+                            if (field.getType().equals(String.class)) {
+                                field.set(c, String.valueOf(map.get(field.getName())));
+                            }
+                        }
                     } catch (IllegalAccessException e) {
                         e.printStackTrace();
                     }
@@ -390,9 +501,8 @@ public class MysqlUtil {
 
     /**
      * 用默認的方式把大寫字母換成_小寫
-     * @return  轉換過的data
      */
-    public static List<Map<String, Object>> autoConvertData1(List<Map<String, Object>> data){
+    public static void autoConvertData1(List<Map<String, Object>> data){
         Set<String> keySet = new HashSet<>();
         data.forEach(map -> keySet.addAll(map.keySet()));
         Map<String,String> convertMap = new HashMap<>();
@@ -406,14 +516,15 @@ public class MysqlUtil {
             }
             convertMap.put(convertKey,key);
         });
-        return convertData(data,customToString(convertMap,"@key=@value",","));
+        List<Map<String, Object>> newMap = convertData(data, customToString(convertMap, "@key=@value", ","));
+        data.clear();
+        data.addAll(newMap);
     }
 
     /**
      * 用默認的方法把_小寫換成大寫
-     * @return  轉換過的data
      */
-    public static List<Map<String, Object>> autoConvertData2(List<Map<String, Object>> data){
+    public static void autoConvertData2(List<Map<String, Object>> data){
         Set<String> keySet = new HashSet<>();
         data.forEach(map -> keySet.addAll(map.keySet()));
         Map<String,String> convertMap = new HashMap<>();
@@ -427,7 +538,9 @@ public class MysqlUtil {
             }
             convertMap.put(convertKey,key);
         });
-        return convertData(data,customToString(convertMap,"@key=@value",","));
+        List<Map<String, Object>> newMap = convertData(data,customToString(convertMap,"@key=@value",","));
+        data.clear();
+        data.addAll(newMap);
     }
 
     /**
@@ -502,6 +615,28 @@ public class MysqlUtil {
     }
 
     /**
+     * 對data進行去重
+     * @param data  要去重的資料
+     */
+    public static void deduplicateData(List<Map<String, Object>> data){
+        HashSet<Map<String, Object>> set = new HashSet<>(data);
+        data.clear();
+        data.addAll(set);
+    }
+
+    /**
+     * 對data的每個map進行挑選，返回挑選結果
+     * @param data  資料源
+     * @param action    對map進行篩選
+     * @return  篩選為true的集合
+     */
+    public static List<Map<String, Object>> filterData(List<Map<String, Object>> data,MapAction action){
+        return data.stream().filter(action::doAction).collect(Collectors.toList());
+    }
+
+    //--------------------------------------------------------------------------------------------------------------------------------------
+
+    /**
      * 把convertString轉成map
      *
      * @param convertString 要轉換的convertString
@@ -510,6 +645,23 @@ public class MysqlUtil {
     private static Map<String, String> convertStringToMap(String convertString) {
         String[] strings = convertString.split(",");
         Map<String, String> map = new HashMap<>();
+        putMap(map,strings);
+        return map;
+    }
+
+    /**
+     * 把convertString轉成map
+     * @param convertString 要轉換的convertString
+     * @return  有序map
+     */
+    private static Map<String, String> convertStringToMap2(String convertString){
+        String[] strings = convertString.split(",");
+        Map<String, String> map = new LinkedHashMap<>();
+        putMap(map,strings);
+        return map;
+    }
+
+    private static void putMap(Map<String, String> map,String[] strings){
         for (String string : strings) {
             String[] s = string.split("=");
             if (s.length != 2 || s[1].equals("")) {
@@ -518,12 +670,36 @@ public class MysqlUtil {
                 map.put(s[0], s[1]);
             }
         }
-        return map;
     }
-
-    private void checkConn() {
-        if (conn == null)
-            getConn();
+    /**
+     * 用cross的方法把兩個data組合
+     * @param data1 資料1
+     * @param data2 資料2
+     * @param convertString 不同的資料轉換,"資料1字段=資料2字段"
+     * @return  合併結果
+     */
+    private static List<Map<String, Object>> combineData(List<Map<String, Object>> data1,List<Map<String, Object>> data2,String convertString){
+        Map<String, String> convertMap = convertStringToMap2(convertString);
+        List<Map<String, Object>> data = new ArrayList<>();
+        data1.forEach(m1->{
+            data2.forEach(m2->{
+                boolean flag=true;
+                for (Map.Entry<String, String> entry : convertMap.entrySet()) {
+                    if(m1.get(entry.getKey())==null){
+                        if(m2.get(entry.getValue())!=null)
+                            flag=false;
+                    }else if(!m1.get(entry.getKey()).equals(m2.get(entry.getValue())))
+                        flag=false;
+                }
+                if(flag){
+                    HashMap<String, Object> newMap = new HashMap<>();
+                    newMap.putAll(m1);
+                    newMap.putAll(m2);
+                    data.add(newMap);
+                }
+            });
+        });
+        return data;
     }
 
     private static Set<Field> getFields(Class clazz) {
@@ -537,8 +713,13 @@ public class MysqlUtil {
         return fields;
     }
 
+    private void checkConn() {
+        if (conn == null)
+            getConn();
+    }
+
     private List<Map<String, Object>> getTableColumns(String tableName) {
-        String sql = "select COLUMN_NAME,COLUMN_KEY from information_schema.COLUMNS where table_name = ?;";
+        String sql = "SELECT COLUMN_NAME,COLUMN_KEY FROM information_schema.`COLUMNS` INNER JOIN (select database() as 'TABLE_SCHEMA') a  USING(TABLE_SCHEMA) WHERE table_name = ?;";
         List<Map<String, Object>> list = new ArrayList<>();
         try {
             list = select(sql, tableName);
@@ -603,5 +784,52 @@ public class MysqlUtil {
                     }
                 }
             }
+    }
+
+    private Object[] makeInsertSql(List<Map<String, Object>> data, String table, String convertString, boolean onDuplicateKeyUpdate){
+        checkConn();
+        Map<String, String> convertMap = MysqlUtil.convertStringToMap(convertString);
+        StringBuilder sql = new StringBuilder("insert ignore into `").append(table).append("`(");
+        ArrayList<Object> paras = new ArrayList<>();
+
+
+//      這邊是insert-select的插入
+//        sql.append(MysqlUtil.customToString(convertMap, "`@key`", ",")).append(") ");
+//        StringBuilder select = new StringBuilder();
+//        data.forEach(m->{
+//            if(select.toString().equals("")){
+//                select.append(" union select ").append(customToString(convertMap,"? as '@key'",","));
+//            }else {
+//                select.append(" union select ").append(customToString(convertMap,"?",","));
+//            }
+//            convertMap.forEach((k,v)->{paras.add(m.get(v));});
+//        });
+//        sql.append(select.toString().replaceFirst(" union ",""));
+
+//        這邊是values (),()的插入
+        sql.append(MysqlUtil.customToString(convertMap, "`@key`", ",")).append(") values ");
+        for (int i = 0; i < data.size(); i++) {
+            if (i != 0)
+                sql.append(",");
+            StringBuilder sb2 = new StringBuilder("(");
+            for (String key : convertMap.keySet()) {
+                sb2.append(",?");
+                paras.add(data.get(i).get(convertMap.get(key)));
+            }
+            sb2.append(")");
+            sql.append(sb2.toString().replaceFirst(",", ""));
+        }
+
+
+        if (onDuplicateKeyUpdate) {
+            sql.append(" ON DUPLICATE KEY UPDATE ").append(MysqlUtil.customToString(convertMap, "@key=IF(ISNULL(VALUES(@key)),@key,VALUES(@key))", ","));
+        }
+        return new Object[]{sql.toString(),paras};
+    }
+
+    //--------------------------------------------------------------------------------------------------------------------------------------
+
+    public interface MapAction{
+        <K,V> boolean doAction(Map<K, V> map);
     }
 }
